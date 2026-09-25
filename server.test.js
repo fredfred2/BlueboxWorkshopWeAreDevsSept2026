@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { createAppServer } = require('./server.js');
+const { createAppServer, getProductPriceDetails, calculateCartTotal } = require('./server.js');
 
 const requestCart = async port => {
   const response = await fetch(`http://localhost:${port}/api/cart?userId=test-user`, {
@@ -10,6 +10,34 @@ const requestCart = async port => {
   });
   return response.status;
 };
+
+test('sale pricing helper applies a 20% discount to featured products', () => {
+  const result = getProductPriceDetails({
+    id: 'aurora-mug',
+    name: 'Aurora Field Mug',
+    priceCents: 2400,
+    featured: true,
+    sale: { enabled: true, discountPercent: 20 },
+  });
+
+  assert.deepEqual(result, {
+    priceCents: 2400,
+    originalPriceCents: 2400,
+    salePriceCents: 1920,
+    hasSale: true,
+    isFeatured: true,
+    discountPercent: 20,
+  });
+});
+
+test('cart totals use discounted prices for sale items', () => {
+  const total = calculateCartTotal([
+    { product: { priceCents: 2400, sale: { enabled: true, discountPercent: 20 } }, quantity: 2 },
+    { product: { priceCents: 1800, sale: { enabled: false, discountPercent: 0 } }, quantity: 1 },
+  ]);
+
+  assert.equal(total, 5640);
+});
 
 test('shop-api handles concurrent cart requests without exhausting an in-memory DB pool', async () => {
   const originalFetch = global.fetch;
