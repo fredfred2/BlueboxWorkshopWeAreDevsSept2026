@@ -5,13 +5,16 @@ const { randomUUID } = require('node:crypto');
 
 const paymentUrl = process.env.PAYMENT_URL || 'http://localhost:4004';
 const postgrestUrl = process.env.POSTGREST_URL || 'http://localhost:3000';
+const defaultDiscountPercent = 20;
+const saleProductIds = new Set(['aurora-mug', 'signal-notebook']);
+
 const products = [
-  { id: 'aurora-mug', name: 'Aurora Field Mug', description: 'A durable enamel mug for early starts and late ideas.', priceCents: 2400, category: 'Desk', emoji: '☕' },
-  { id: 'signal-notebook', name: 'Signal Notebook', description: 'Dot-grid pages for diagrams, traces, and half-formed plans.', priceCents: 1800, category: 'Desk', emoji: '📓' },
-  { id: 'orbit-lamp', name: 'Orbit Desk Lamp', description: 'A warm, adjustable glow for focused work.', priceCents: 6400, category: 'Studio', emoji: '💡' },
-  { id: 'cloud-socks', name: 'Cloudline Socks', description: 'Soft merino socks for long pairing sessions.', priceCents: 1600, category: 'Wear', emoji: '🧦' },
-  { id: 'field-bag', name: 'Field Notes Bag', description: 'A compact canvas carry for your everyday kit.', priceCents: 5200, category: 'Carry', emoji: '👜' },
-  { id: 'night-hoodie', name: 'Night Shift Hoodie', description: 'A heavyweight layer for cool offices and warmer thinking.', priceCents: 7200, category: 'Wear', emoji: '🧥' },
+  { id: 'aurora-mug', name: 'Aurora Field Mug', description: 'A durable enamel mug for early starts and late ideas.', priceCents: 2400, category: 'Desk', emoji: '☕', featured: true, discountPercent: 20 },
+  { id: 'signal-notebook', name: 'Signal Notebook', description: 'Dot-grid pages for diagrams, traces, and half-formed plans.', priceCents: 1800, category: 'Desk', emoji: '📓', featured: true, discountPercent: 20 },
+  { id: 'orbit-lamp', name: 'Orbit Desk Lamp', description: 'A warm, adjustable glow for focused work.', priceCents: 6400, category: 'Studio', emoji: '💡', featured: false, discountPercent: 0 },
+  { id: 'cloud-socks', name: 'Cloudline Socks', description: 'Soft merino socks for long pairing sessions.', priceCents: 1600, category: 'Wear', emoji: '🧦', featured: false, discountPercent: 0 },
+  { id: 'field-bag', name: 'Field Notes Bag', description: 'A compact canvas carry for your everyday kit.', priceCents: 5200, category: 'Carry', emoji: '👜', featured: false, discountPercent: 0 },
+  { id: 'night-hoodie', name: 'Night Shift Hoodie', description: 'A heavyweight layer for cool offices and warmer thinking.', priceCents: 7200, category: 'Wear', emoji: '🧥', featured: false, discountPercent: 0 },
 ];
 
 const send = (res, status, value, type = 'application/json') => { res.writeHead(status, { 'content-type': type }); res.end(type === 'application/json' ? JSON.stringify(value) : value); };
@@ -22,7 +25,56 @@ const database = async (url, options = {}) => {
   if (!response.ok) throw new Error(data?.message || data?.details || `Database request failed: ${response.status}`);
   return data;
 };
-const mapProduct = product => ({ ...product, priceCents: product.price_cents, price_cents: undefined });
+
+const getProductPriceDetails = (product = {}) => {
+  const originalPriceCents = Number(product.originalPriceCents ?? product.priceCents ?? product.price_cents ?? 0);
+  const discountPercent = Number(product.discountPercent ?? product.discount_percent ?? product.sale?.discountPercent ?? (saleProductIds.has(product.id) ? defaultDiscountPercent : 0));
+  const hasSale = Boolean(product.hasSale ?? product.onSale ?? product.sale?.enabled ?? product.saleEnabled ?? (discountPercent > 0 || saleProductIds.has(product.id)));
+  const effectiveDiscountPercent = hasSale ? Math.min(Math.max(discountPercent, 0), 100) : 0;
+  const salePriceCents = hasSale ? Math.round(originalPriceCents * (1 - effectiveDiscountPercent / 100)) : originalPriceCents;
+  return {
+    priceCents: originalPriceCents,
+    originalPriceCents,
+    salePriceCents,
+    hasSale,
+    isFeatured: Boolean(product.featured ?? product.isFeatured ?? false),
+    discountPercent: effectiveDiscountPercent,
+  };
+};
+
+const calculateCartTotal = items => items.reduce((total, item) => total + (getProductPriceDetails(item.product).salePriceCents * Number(item.quantity || 0)), 0);
+const mapProduct = product => {
+  const priceDetails = getProductPriceDetails(product);
+  return {
+    ...product,
+    priceCents: priceDetails.priceCents,
+    originalPriceCents: priceDetails.originalPriceCents,
+    salePriceCents: priceDetails.salePriceCents,
+    hasSale: priceDetails.hasSale,
+    isFeatured: priceDetails.isFeatured || priceDetails.hasSale,
+    discountPercent: priceDetails.discountPercent,
+    sale: { enabled: priceDetails.hasSale, discountPercent: priceDetails.discountPercent },
+    price_cents: undefined,
+    discount_percent: undefined,
+    featured: Boolean(product.featured ?? (priceDetails.isFeatured || priceDetails.hasSale)),
+  };
+};
+
+const cartLocks = new Map();
+const withCartLock = async (userId, task) => {
+  const previous = cartLocks.get(userId) || Promise.resolve();
+  let release;
+  const current = new Promise(resolve => { release = resolve; });
+  cartLocks.set(userId, current);
+  await previous;
+  try {
+    return await task();
+  } finally {
+    release();
+    if (cartLocks.get(userId) === current) cartLocks.delete(userId);
+  }
+};
+
 const cart = userId => database(`/carts?user_id=eq.${encodeURIComponent(userId)}&select=quantity,products(*)`).then(items => items.map(item => ({ product: mapProduct(item.products), quantity: item.quantity })));
 
 async function route(req, res, url) {
@@ -31,15 +83,20 @@ async function route(req, res, url) {
   const userId = url.searchParams.get('userId') || 'workshop-user';
   if (url.pathname === '/api/cart' && req.method === 'GET') return send(res, 200, await cart(userId));
   if (url.pathname === '/api/cart' && req.method === 'POST') {
-    const input = await readBody(req); const existing = await database(`/carts?user_id=eq.${encodeURIComponent(userId)}&product_id=eq.${encodeURIComponent(input.productId)}&select=quantity`);
-    const quantity = (existing[0]?.quantity || 0) + Number(input.quantity || 1);
-    await database('/carts', { method: 'POST', headers: { Prefer: 'resolution=merge-duplicates,return=representation' }, body: JSON.stringify({ user_id: userId, product_id: input.productId, quantity }) });
-    return send(res, 200, await cart(userId));
+    const input = await readBody(req);
+    const quantity = Number(input.quantity || 1);
+    const updatedCart = await withCartLock(userId, async () => {
+      const existing = await database(`/carts?user_id=eq.${encodeURIComponent(userId)}&product_id=eq.${encodeURIComponent(input.productId)}&select=quantity`);
+      const nextQuantity = (existing[0]?.quantity || 0) + quantity;
+      await database('/carts', { method: 'POST', headers: { Prefer: 'resolution=merge-duplicates,return=representation' }, body: JSON.stringify({ user_id: userId, product_id: input.productId, quantity: nextQuantity }) });
+      return cart(userId);
+    });
+    return send(res, 200, updatedCart);
   }
   if (url.pathname === '/api/cart' && req.method === 'DELETE') { await database(`/carts?user_id=eq.${encodeURIComponent(userId)}`, { method: 'DELETE' }); return send(res, 204, null); }
   if (url.pathname === '/api/checkout' && req.method === 'POST') {
     const input = await readBody(req); const items = await cart(userId); if (!items.length) return send(res, 400, { error: 'Your cart is empty' });
-    const totalCents = items.reduce((total, item) => total + item.product.priceCents * item.quantity, 0);
+    const totalCents = calculateCartTotal(items);
     const orderId = `order_${randomUUID().slice(0, 8)}`;
     const charge = attempt => {
       const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), 150);
@@ -67,4 +124,4 @@ if (require.main === module) {
   createAppServer().listen(port, () => console.log(`shop API and frontend running at http://localhost:${port}`));
 }
 
-module.exports = { createAppServer, route, database, mapProduct };
+module.exports = { createAppServer, route, database, mapProduct, getProductPriceDetails, calculateCartTotal };
